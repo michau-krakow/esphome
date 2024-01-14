@@ -108,6 +108,9 @@ void TuyaLight::dump_config() {
   if (this->color_id_.has_value()) {
     ESP_LOGCONFIG(TAG, "   Color has datapoint ID %u", *this->color_id_);
   }
+  if (this->color_temperature_id_.has_value()) {
+    ESP_LOGCONFIG(TAG, "   CCT has datapoint ID %u", *this->color_temperature_id_);
+  }
 }
 
 light::LightTraits TuyaLight::get_traits() {
