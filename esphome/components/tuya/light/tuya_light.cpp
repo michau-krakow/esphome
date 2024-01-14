@@ -8,88 +8,94 @@ namespace tuya {
 static const char *const TAG = "tuya.light";
 
 void TuyaLight::setup() {
+
+  auto publish_mcu_updated_ct = [this](const TuyaDatapoint &datapoint) {
+    auto ct_value = datapoint.value_uint;
+    if (this->color_temperature_invert_) {
+      ct_value = this->color_temperature_max_value_ - ct_value;
+    }
+
+    if (this->state_->remote_values.get_color_temperature() != ct_value) {
+      ESP_LOGI(TAG, "MCU updated CT: %u", ct_value);
+      this->state_->remote_values.set_color_temperature(this->cold_white_temperature_ +
+                            (this->warm_white_temperature_ - this->cold_white_temperature_) *
+                            (float(ct_value) / this->color_temperature_max_value_));
+      this->state_->publish_state();
+    }
+  };
+
+  auto publish_mcu_updated_brightness = [this](const TuyaDatapoint &datapoint) {
+    float brightness = float(datapoint.value_uint) / this->max_value_;
+    if (this->state_->remote_values.get_brightness() != brightness) {
+      ESP_LOGI(TAG, "MCU updated brightness: %0.2f", brightness);
+      this->state_->remote_values.set_brightness(brightness);
+      this->state_->publish_state();
+    }
+  };
+
+  auto publish_mcu_updated_state = [this](const TuyaDatapoint &datapoint) {
+    bool state = datapoint.value_bool;
+    if (this->state_->remote_values.get_state() != state) {
+      ESP_LOGI(TAG, "MCU updated state: %s", ONOFF(state));
+      this->state_->remote_values.set_state(state);
+      this->state_->publish_state();
+    }
+  };
+
+  auto publish_mcu_updated_color = [this](const TuyaDatapoint &datapoint) {
+    float red, green, blue;
+    switch (*this->color_type_) {
+      case TuyaColorType::RGBHSV:
+      case TuyaColorType::RGB: {
+        auto rgb = parse_hex<uint32_t>(datapoint.value_string.substr(0, 6));
+        if (!rgb.has_value())
+          return;
+
+        red = (*rgb >> 16) / 255.0f;
+        green = ((*rgb >> 8) & 0xff) / 255.0f;
+        blue = (*rgb & 0xff) / 255.0f;
+        break;
+      }
+      case TuyaColorType::HSV: {
+        auto hue = parse_hex<uint16_t>(datapoint.value_string.substr(0, 4));
+        auto saturation = parse_hex<uint16_t>(datapoint.value_string.substr(4, 4));
+        auto value = parse_hex<uint16_t>(datapoint.value_string.substr(8, 4));
+        if (!hue.has_value() || !saturation.has_value() || !value.has_value())
+          return;
+
+        hsv_to_rgb(*hue, float(*saturation) / 1000, float(*value) / 1000, red, green, blue);
+        break;
+      }
+    }
+
+    float current_red, current_green, current_blue;
+    this->state_->remote_values.as_rgb(&current_red, &current_green, &current_blue);
+    if (red != current_red || green != current_green || blue != current_blue) {
+      ESP_LOGI(TAG, "MCU updated RGB: %0.2f %0.2f %0.2f", red, green, blue);
+      this->state_->remote_values.set_red(red);
+      this->state_->remote_values.set_green(green);
+      this->state_->remote_values.set_blue(blue);
+      this->state_->publish_state();
+    }
+  };
+
+  // TuyaMCU may update datapoints by 'itself', i.e. by user operating external radio remote...
+  // We want to pick this and update LightState value accordingly (to display on frontend).
+
   if (this->color_temperature_id_.has_value()) {
-    this->parent_->register_listener(*this->color_temperature_id_, [this](const TuyaDatapoint &datapoint) {
-      if (this->state_->current_values != this->state_->remote_values) {
-        ESP_LOGD(TAG, "Light is transitioning, datapoint change ignored");
-        return;
-      }
-
-      auto datapoint_value = datapoint.value_uint;
-      if (this->color_temperature_invert_) {
-        datapoint_value = this->color_temperature_max_value_ - datapoint_value;
-      }
-      auto call = this->state_->make_call();
-      call.set_color_temperature(this->cold_white_temperature_ +
-                                 (this->warm_white_temperature_ - this->cold_white_temperature_) *
-                                     (float(datapoint_value) / this->color_temperature_max_value_));
-      call.perform();
-    });
+    this->parent_->register_listener(*this->color_temperature_id_, publish_mcu_updated_ct);
   }
+
   if (this->dimmer_id_.has_value()) {
-    this->parent_->register_listener(*this->dimmer_id_, [this](const TuyaDatapoint &datapoint) {
-      if (this->state_->current_values != this->state_->remote_values) {
-        ESP_LOGD(TAG, "Light is transitioning, datapoint change ignored");
-        return;
-      }
-
-      auto call = this->state_->make_call();
-      call.set_brightness(float(datapoint.value_uint) / this->max_value_);
-      call.perform();
-    });
+    this->parent_->register_listener(*this->dimmer_id_, publish_mcu_updated_brightness);
   }
+
   if (switch_id_.has_value()) {
-    this->parent_->register_listener(*this->switch_id_, [this](const TuyaDatapoint &datapoint) {
-      if (this->state_->current_values != this->state_->remote_values) {
-        ESP_LOGD(TAG, "Light is transitioning, datapoint change ignored");
-        return;
-      }
-
-      auto call = this->state_->make_call();
-      call.set_state(datapoint.value_bool);
-      call.perform();
-    });
+    this->parent_->register_listener(*this->switch_id_, publish_mcu_updated_state);
   }
+
   if (color_id_.has_value()) {
-    this->parent_->register_listener(*this->color_id_, [this](const TuyaDatapoint &datapoint) {
-      if (this->state_->current_values != this->state_->remote_values) {
-        ESP_LOGD(TAG, "Light is transitioning, datapoint change ignored");
-        return;
-      }
-
-      float red, green, blue;
-      switch (*this->color_type_) {
-        case TuyaColorType::RGBHSV:
-        case TuyaColorType::RGB: {
-          auto rgb = parse_hex<uint32_t>(datapoint.value_string.substr(0, 6));
-          if (!rgb.has_value())
-            return;
-
-          red = (*rgb >> 16) / 255.0f;
-          green = ((*rgb >> 8) & 0xff) / 255.0f;
-          blue = (*rgb & 0xff) / 255.0f;
-          break;
-        }
-        case TuyaColorType::HSV: {
-          auto hue = parse_hex<uint16_t>(datapoint.value_string.substr(0, 4));
-          auto saturation = parse_hex<uint16_t>(datapoint.value_string.substr(4, 4));
-          auto value = parse_hex<uint16_t>(datapoint.value_string.substr(8, 4));
-          if (!hue.has_value() || !saturation.has_value() || !value.has_value())
-            return;
-
-          hsv_to_rgb(*hue, float(*saturation) / 1000, float(*value) / 1000, red, green, blue);
-          break;
-        }
-      }
-
-      float current_red, current_green, current_blue;
-      this->state_->current_values_as_rgb(&current_red, &current_green, &current_blue);
-      if (red == current_red && green == current_green && blue == current_blue)
-        return;
-      auto rgb_call = this->state_->make_call();
-      rgb_call.set_rgb(red, green, blue);
-      rgb_call.perform();
-    });
+    this->parent_->register_listener(*this->color_id_, publish_mcu_updated_color);
   }
 
   if (min_value_datapoint_id_.has_value()) {
